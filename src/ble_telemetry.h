@@ -2,6 +2,9 @@
 #pragma once
 #include "telemetry_shared.h"
 
+// Debug flag for BLE operations
+#define BLE_DEBUG 1
+
 #ifdef __cplusplus
 extern "C" {
 #endif

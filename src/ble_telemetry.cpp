@@ -124,6 +124,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     // For testing: disable re-auth requirement so clients can connect immediately
     clientAuthorized = true;
     Serial.println("[BLE] Client connected (auth disabled for testing)");
+    Serial.println("[BLE] deviceConnected=" + String(deviceConnected) + " clientAuthorized=" + String(clientAuthorized));
   }
   void onDisconnect(NimBLEServer* server) {
     deviceConnected = false;
@@ -407,11 +408,27 @@ static void buildAndSetAdvertFromSnapshot() {
 
 // ---------------- Notifications ----------------
 static void sendNotificationIfConnected() {
-  if (!deviceConnected || !pStreamChar) return;
-  if (REQUIRE_APP_AUTH && !clientAuthorized) {
-    // Do not send full notifications until client authorized
+  static uint32_t lastDebugTime = 0;
+  uint32_t now = millis();
+  
+  if (!deviceConnected || !pStreamChar) {
+    if (now - lastDebugTime >= 5000) { // Print every 5 seconds to avoid flooding
+      Serial.printf("[BLE] Skip notification: connected=%d pStreamChar=%d clientAuth=%d\n", 
+                   deviceConnected, (pStreamChar != nullptr), clientAuthorized);
+      lastDebugTime = now;
+    }
     return;
   }
+
+  if (REQUIRE_APP_AUTH && !clientAuthorized) {
+    if (now - lastDebugTime >= 5000) {
+      Serial.println("[BLE] Skip notification: auth required but not authorized");
+      lastDebugTime = now;
+    }
+    return;
+  }
+
+  Serial.println("[BLE] Preparing notification...");
   Telemetry s;
   if (snapshotMutex && xSemaphoreTake(snapshotMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
     s = lastSnapshot;
@@ -443,7 +460,21 @@ static void sendNotificationIfConnected() {
   memcpy(lastPacketBuf, packet, idx);
   // send notify - use indicate for critical one-shot messages if you want guaranteed delivery
   lastPacketLen = idx;
-  pStreamChar->notify(lastPacketBuf, lastPacketLen);
+  Serial.print("[BLE] Sending notification, len=");
+  Serial.print(lastPacketLen);
+  Serial.print(" data=");
+  for(int i = 0; i < lastPacketLen; i++) {
+    if(lastPacketBuf[i] < 16) Serial.print("0");
+    Serial.print(lastPacketBuf[i], HEX);
+    Serial.print(" ");
+  }
+  Serial.println();
+  
+  if (pStreamChar->notify(lastPacketBuf, lastPacketLen)) {
+    Serial.println("[BLE] Notification sent successfully");
+  } else {
+    Serial.println("[BLE] Failed to send notification");
+  }
   lastSentAt = now_ms(); 
   awaitingAck = true;
 }
@@ -490,9 +521,27 @@ static void bleTask(void* pv) {
       buildAndSetAdvertFromSnapshot();
     }
 
+    static uint32_t notifyCounter = 0;
     if (deviceConnected && (nowT - lastNotify >= notifyPeriod)) {
       lastNotify = nowT;
+      notifyCounter++;
+      
+      Serial.printf("\n[BLE] Notification #%lu: connected=%d auth=%d\n", 
+                   notifyCounter, deviceConnected, clientAuthorized);
+      
+      // Read current snapshot for debug
+      Telemetry s;
+      if (snapshotMutex && xSemaphoreTake(snapshotMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        s = lastSnapshot;
+        xSemaphoreGive(snapshotMutex);
+        Serial.printf("[BLE] Current values: BPM=%.1f SPO2=%.1f CO2=%.1f\n",
+                     s.bpm, s.spo2, s.co2ppm);
+      } else {
+        Serial.println("[BLE] Failed to read snapshot!");
+      }
+      
       sendNotificationIfConnected();
+      Serial.println("[BLE] Notification cycle complete");
     }
 
     // resend if ACK not received in time
@@ -587,11 +636,21 @@ void ble_start() {
 
 // Publish snapshot (called by main/OLED task). Thread-safe copy.
 void ble_publish_snapshot(const Telemetry* snapshot) {
-  if (!snapshot) return;
-  if (!snapshotMutex) snapshotMutex = xSemaphoreCreateMutex();
+  if (!snapshot) {
+    Serial.println("[BLE] ERROR: Null snapshot pointer");
+    return;
+  }
+  if (!snapshotMutex) {
+    Serial.println("[BLE] Creating snapshot mutex");
+    snapshotMutex = xSemaphoreCreateMutex();
+  }
   if (xSemaphoreTake(snapshotMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
     lastSnapshot = *snapshot;
+    Serial.printf("[BLE] New snapshot: BPM=%.1f SPO2=%.1f CO2=%.1f\n", 
+                 snapshot->bpm, snapshot->spo2, snapshot->co2ppm);
     xSemaphoreGive(snapshotMutex);
+  } else {
+    Serial.println("[BLE] Failed to take snapshot mutex");
   }
   // Immediately update advert (kick)
   buildAndSetAdvertFromSnapshot();

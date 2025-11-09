@@ -385,14 +385,26 @@ void oledTask(void* pv) {
         vTaskDelayUntil(&lastWake, framePeriod);
         frameCounter++;
 
+        static uint32_t lastDebugTime = 0;
+        uint32_t now = millis();
+        
         Telemetry snap;
         if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             snap = telem;
             xSemaphoreGive(dataMutex);
+            
+            // Debug print every 5 seconds
+            if (now - lastDebugTime >= 5000) {
+                Serial.printf("[OLED] Publishing: BPM=%.1f SPO2=%.1f CO2=%.1f\n",
+                            snap.bpm, snap.spo2, snap.co2ppm);
+                lastDebugTime = now;
+            }
+            
+            // push snapshot to BLE module (non-blocking)
+            ble_publish_snapshot(&snap);
+        } else {
+            Serial.println("[OLED] Failed to take dataMutex!");
         }
-
-        // push snapshot to BLE module (non-blocking)
-        ble_publish_snapshot(&snap);
 
         // Push latest IR into rolling buffer (safe)
         dispBuf[idx] = snap.lastIR > 0 ? snap.lastIR : 0;
@@ -571,4 +583,7 @@ void oledTask(void* pv) {
     }
 }
 
-void loop(){ vTaskDelay(pdMS_TO_TICKS(1000)); }
+void loop(){ 
+  vTaskDelay(pdMS_TO_TICKS(1000)); 
+}
+
