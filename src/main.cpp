@@ -7,6 +7,8 @@
 #include <TinyGPSPlus.h>
 #include "MAX30105.h"
 #include "PulseAlgorithm.h"
+#include "telemetry_shared.h"
+#include "ble_telemetry.h"
 #include <U8g2lib.h>
 #include <math.h>
 
@@ -46,32 +48,7 @@ SemaphoreHandle_t i2cMutex = nullptr;
 SemaphoreHandle_t dataMutex = nullptr;
 
 // ----------------- Telemetry (shared) -----------------
-struct Telemetry {
-  float bpm = 0.0f;
-  float spo2 = 0.0f;
-  // IMU
-  float roll=0, pitch=0, yaw=0;
-  float ax=0, ay=0, az=0;
-  float gx=0, gy=0, gz=0;
-  bool freefall = false;
-  bool shock = false;
-  bool tilt = false;
-  bool vibration = false;
-  bool fall = false;
-  // BME
-  float tempBME = NAN, humBME = NAN, pressBME = NAN;
-  // GPS
-  double lat = 0.0, lon = 0.0, alt = 0.0, speed = 0.0;
-  // MQ
-  float co2ppm = NAN;
-  // Raw latest IR/RED for display
-  int32_t lastIR = 0;
-  int32_t lastRED = 0;
-  bool maxOK = false;
-  bool imuOK = false;
-  bool bmeOK = false;
-  bool gpsOK = false;
-} telem;
+Telemetry telem;
 
 // Display state
 static uint8_t oledPage = 0;
@@ -245,6 +222,8 @@ void setup() {
   u8g2.sendBuffer();
   delay(1100);
 
+  ble_setup();
+  ble_start(); // creates BLETask
   // Create tasks
   xTaskCreatePinnedToCore(maxTask, "MAXTask", 8192, NULL, 6, NULL, 1);
   xTaskCreatePinnedToCore(imuTask, "IMUTask", 6144, NULL, 6, NULL, 1);
@@ -411,6 +390,9 @@ void oledTask(void* pv) {
             snap = telem;
             xSemaphoreGive(dataMutex);
         }
+
+        // push snapshot to BLE module (non-blocking)
+        ble_publish_snapshot(&snap);
 
         // Push latest IR into rolling buffer (safe)
         dispBuf[idx] = snap.lastIR > 0 ? snap.lastIR : 0;
