@@ -1,5 +1,5 @@
 // ble_telemetry.cpp
-// Complete BLE telemetry module (fixed compilation errors)
+// FIXED: Proper connectable advertising and GATT server setup
 #include "ble_telemetry.h"
 #include <NimBLEDevice.h>
 #include <string.h>
@@ -7,10 +7,8 @@
 #include <math.h>
 
 // ---------------- CONFIG ----------------
-static const uint16_t COMPANY_ID = 0x02E5; // little-endian in adv (E5 02)
+static const uint16_t COMPANY_ID = 0x02E5;
 static const uint8_t PROTO_VER = 1;
-// Friendly device name shown in most scanners (change for your device)
-// Friendly device name shown in most scanners (change for your device)
 static const char* DEVICE_NAME = "ESP32_BLE";
 
 // UUIDs
@@ -18,20 +16,14 @@ static const char* TELEMETRY_SVC_UUID    = "0000A100-0000-1000-8000-00805F9B34FB
 static const char* TELEMETRY_STREAM_UUID = "0000A101-0000-1000-8000-00805F9B34FB";
 static const char* CONTROL_UUID          = "0000A103-0000-1000-8000-00805F9B34FB";
 
-// Connectable window (ms) when urgent seen
-static const uint32_t CONNECTABLE_WINDOW_MS = 30 * 1000UL; // 30s
-
-// Advert intervals (best-effort)
+static const uint32_t CONNECTABLE_WINDOW_MS = 30 * 1000UL;
 static const uint32_t ADVERT_INTERVAL_MS_NORMAL = 500;
 static const uint32_t ADVERT_INTERVAL_MS_URGENT = 120;
 
-// Require application-level auth for notifications (true = require token before streaming)
-// Disable application-level auth for now to allow easy connection during testing
-// (commenting out auth logic that may prevent clients from receiving notifications)
+// CRITICAL: Keep connectable for testing
+static const bool FORCE_CONNECTABLE_FOR_TESTING = true;
 static const bool REQUIRE_APP_AUTH = false;
-
-// Pre-shared 32-bit token (example). Change to your own secret for your client.
-static const uint32_t APP_AUTH_TOKEN = 0xA1B2C3D4; // client must write this (LE byte order) to CONTROL char
+static const uint32_t APP_AUTH_TOKEN = 0xA1B2C3D4;
 
 // ---------------- internal state ----------------
 static Telemetry lastSnapshot;
@@ -43,37 +35,35 @@ static NimBLECharacteristic* pControlChar = nullptr;
 static NimBLEAdvertising* pAdvertising = nullptr;
 
 static bool deviceConnected = false;
-static bool clientAuthorized = false; // set true when client writes correct token
+static bool clientAuthorized = false;
+static bool clientSubscribed = false; // Track subscription state
 static uint8_t seqNo = 0;
 
-static uint32_t connectableUntil = 0; // ms timestamp until which advertising is connectable
+static uint32_t connectableUntil = 0;
 static bool isCurrentlyConnectable = false;
-
-// store last manufacturer data blob so we can reapply it (NimBLEAdvertising has no getter)
 static std::string lastManufacturerData;
 
-// lightweight ACK + retransmit variables
 static uint8_t lastPacketBuf[64];
 static uint8_t lastPacketLen = 0;
 static uint32_t lastSentAt = 0;
-static const uint32_t RETRANSMIT_TIMEOUT_MS = 1000; // resend if no ack within 1s
+static const uint32_t RETRANSMIT_TIMEOUT_MS = 1000;
 static bool awaitingAck = false;
 
-// Startup snapshot capture + manufacturer update throttling
-// For testing set to 0 so initial manufacturer blob is captured immediately after BLE setup.
-// Set back to 4000 (or a few seconds) for production to let sensors stabilize.
-static const uint32_t STARTUP_SNAPSHOT_DELAY_MS = 0; // was 4000
-static const uint32_t MANUF_UPDATE_INTERVAL_MS = 10000; // after initial snapshot, update manuf data at most every 10s
+static const uint32_t STARTUP_SNAPSHOT_DELAY_MS = 0;
+static const uint32_t MANUF_UPDATE_INTERVAL_MS = 10000;
 static uint32_t startupCaptureUntil = 0;
 static bool startupSnapshotCaptured = false;
 static uint32_t lastManufacturerUpdateAt = 0;
 
-// For quick testing: set to true to force the device to advertise as CONNECTABLE on startup.
-// This makes the device show up in phone/OS Bluetooth lists that only display connectable devices.
-// Remember to set back to 'false' for production to preserve non-connectable low-power behaviour.
-static const bool FORCE_CONNECTABLE_FOR_TESTING = true;
+// Alert smoothing
+static const int CONSECUTIVE_FOR_ABNORMAL = 3;
+static const int CONSECUTIVE_FOR_GPS_LOSS = 3;
+static const int HOLD_MS_IMU_EVENTS = 3000;
 
-// Helper: print bytes as hex to Serial
+static int lowBpmCount = 0, highBpmCount = 0, lowSpO2Count = 0, co2HighCount = 0;
+static int gpsGoodCount = 0, gpsBadCount = 0;
+static uint32_t lastFreefallSeenAt = 0, lastVibrationSeenAt = 0, lastShockSeenAt = 0, lastFallSeenAt = 0, lastTiltSeenAt = 0;
+
 static void printHex(const std::string &s) {
   for (size_t i = 0; i < s.size(); ++i) {
     uint8_t b = (uint8_t)s[i];
@@ -84,7 +74,6 @@ static void printHex(const std::string &s) {
   Serial.println();
 }
 
-// ---------- CRC8/MAXIM ----------
 static uint8_t crc8_maxim(const uint8_t *data, size_t len) {
   uint8_t crc = 0x00;
   for (size_t i = 0; i < len; ++i) {
@@ -98,40 +87,78 @@ static uint8_t crc8_maxim(const uint8_t *data, size_t len) {
   return crc;
 }
 
-// Utility write int24 LE
 static void writeInt24LE(uint8_t* out, int32_t v) {
   out[0] = v & 0xFF;
   out[1] = (v >> 8) & 0xFF;
   out[2] = (v >> 16) & 0xFF;
 }
 
-// Convenience: millis wrapper
 static inline uint32_t now_ms() { return (uint32_t)millis(); }
 
-// Forward declarations (with default arguments)
+// Forward declarations
 static void buildAndSetAdvertFromSnapshot();
 static void sendNotificationIfConnected();
 static void evaluateAlertsFromSnapshot(Telemetry &s);
 static void requestConnectableWindow(uint32_t ms);
-static void startNonConnectableAdvert(uint32_t intervalMs = ADVERT_INTERVAL_MS_NORMAL);
-static void startConnectableAdvert(uint32_t intervalMs = ADVERT_INTERVAL_MS_URGENT);
-static void handleAck(uint8_t ackSeq); // ADDED: Forward declaration for handleAck
+static void startAdvertising();
+static void handleAck(uint8_t ackSeq);
 
 // ---------------- NimBLE Server callbacks ----------------
 class ServerCallbacks : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer* server) {
+  void onConnect(NimBLEServer* server, ble_gap_conn_desc* desc) {
     deviceConnected = true;
-    // For testing: disable re-auth requirement so clients can connect immediately
-    clientAuthorized = true;
-    Serial.println("[BLE] Client connected (auth disabled for testing)");
-    Serial.println("[BLE] deviceConnected=" + String(deviceConnected) + " clientAuthorized=" + String(clientAuthorized));
+    clientAuthorized = true; // Auto-auth for testing
+    Serial.println("\n╔════════════════════════════════════════╗");
+    Serial.println("║     ✅ CLIENT CONNECTED TO ESP32      ║");
+    Serial.println("╚════════════════════════════════════════╝");
+    Serial.printf("[BLE] Device Name: %s\n", DEVICE_NAME);
+    Serial.printf("[BLE] Client Address: %s\n", NimBLEAddress(desc->peer_ota_addr).toString().c_str());
+    Serial.printf("[BLE] Connection ID: %d\n", desc->conn_handle);
+    Serial.printf("[BLE] Status: connected=%d auth=%d\n", deviceConnected, clientAuthorized);
+    Serial.println("════════════════════════════════════════\n");
+    
+    // Update connection parameters for better throughput
+    server->updateConnParams(desc->conn_handle, 24, 48, 0, 400);
   }
+  
   void onDisconnect(NimBLEServer* server) {
     deviceConnected = false;
     clientAuthorized = false;
-    Serial.println("[BLE] Client disconnected");
-    // Restart advertising (task loop will ensure correct mode)
-    if (pAdvertising) pAdvertising->start();
+    clientSubscribed = false;
+    Serial.println("\n╔════════════════════════════════════════╗");
+    Serial.println("║        ❌ CLIENT DISCONNECTED          ║");
+    Serial.println("╚════════════════════════════════════════╝\n");
+    
+    // Restart advertising
+    delay(500);
+    if (pAdvertising) {
+      startAdvertising();
+    }
+  }
+};
+
+// CRITICAL: Track subscription state
+class StreamCharCallbacks : public NimBLECharacteristicCallbacks {
+  void onSubscribe(NimBLECharacteristic* pChar, ble_gap_conn_desc* desc, uint16_t subValue) {
+    if (subValue == 0x0001) {
+      clientSubscribed = true;
+      Serial.println("\n╔════════════════════════════════════════╗");
+      Serial.println("║   🔔 CLIENT SUBSCRIBED TO STREAM!     ║");
+      Serial.println("╚════════════════════════════════════════╝");
+      Serial.println("[BLE] Notifications ENABLED");
+      Serial.println("[BLE] Starting telemetry stream...");
+      Serial.println("════════════════════════════════════════\n");
+    } else if (subValue == 0x0002) {
+      clientSubscribed = true;
+      Serial.println("[BLE] 📬 Client enabled INDICATIONS");
+    } else if (subValue == 0x0000) {
+      clientSubscribed = false;
+      Serial.println("[BLE] 🔕 Client UNSUBSCRIBED from notifications");
+    }
+  }
+  
+  void onRead(NimBLECharacteristic* pChar) {
+    Serial.println("[BLE] 📖 Client READ stream characteristic");
   }
 };
 
@@ -139,45 +166,41 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 class ControlCallback : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* chr) {
     std::string v = chr->getValue();
+    
+    Serial.printf("[BLE] 📝 Control write received: %d bytes\n", v.size());
 
-    // check for 3-byte ACK: "ACK" + seq
+    // Check for ACK
     if (v.size() == 4 && v[0]=='A' && v[1]=='C' && v[2]=='K') {
       handleAck((uint8_t)v[3]);
       return;
     }
 
     if (v.size() == 4) {
-      // interpret 4 bytes as little-endian uint32 token
       uint32_t tok = (uint8_t)v[0] | ((uint8_t)v[1]<<8) | ((uint8_t)v[2]<<16) | ((uint8_t)v[3]<<24);
+      Serial.printf("[BLE] Auth token received: 0x%08X\n", tok);
       if (tok == APP_AUTH_TOKEN) {
         clientAuthorized = true;
-        Serial.println("[BLE] Client authorized via token");
-        // Optionally: reply with ACK via same char
+        Serial.println("[BLE] 🔐 Client AUTHORIZED via token");
         const char ack[] = "OK";
         chr->setValue((uint8_t*)ack, 2);
+        chr->notify();
       } else {
         clientAuthorized = false;
-        Serial.println("[BLE] Client auth token invalid");
+        Serial.println("[BLE] ⚠️ Client auth token INVALID");
         const char nak[] = "NO";
         chr->setValue((uint8_t*)nak, 2);
+        chr->notify();
       }
     } else {
-      // Could be other control commands. For now we ignore/ack unknown lengths.
-      Serial.printf("[BLE] Control write len=%u\n", (unsigned)v.size());
+      Serial.printf("[BLE] Unknown control command, len=%u\n", (unsigned)v.size());
     }
+  }
+  
+  void onRead(NimBLECharacteristic* chr) {
+    Serial.println("[BLE] 📖 Client READ control characteristic");
   }
 };
 
-// ---------------- Alert smoothing constants (same as before) ----------------
-static const int CONSECUTIVE_FOR_ABNORMAL = 3;
-static const int CONSECUTIVE_FOR_GPS_LOSS = 3;
-static const int HOLD_MS_IMU_EVENTS = 3000;
-
-static int lowBpmCount = 0, highBpmCount = 0, lowSpO2Count = 0, co2HighCount = 0;
-static int gpsGoodCount = 0, gpsBadCount = 0;
-static uint32_t lastFreefallSeenAt = 0, lastVibrationSeenAt = 0, lastShockSeenAt = 0, lastFallSeenAt = 0, lastTiltSeenAt = 0;
-
-// ---------------- Evaluate alerts (same algorithm from earlier) ----------------
 static void evaluateAlertsFromSnapshot(Telemetry &s) {
   uint32_t now = now_ms();
   if (s.freefall) lastFreefallSeenAt = now;
@@ -198,7 +221,6 @@ static void evaluateAlertsFromSnapshot(Telemetry &s) {
   s.fall = heldFall;
   s.tilt = heldTilt;
 
-  // BPM/SpO2 logic
   float bpm = s.bpm;
   float spo2 = s.spo2;
   bool bpmValid = (bpm > 0.5f && isfinite(bpm));
@@ -219,97 +241,61 @@ static void evaluateAlertsFromSnapshot(Telemetry &s) {
                         (lowSpO2Count >= CONSECUTIVE_FOR_ABNORMAL) ||
                         (co2HighCount >= CONSECUTIVE_FOR_ABNORMAL);
 
-  // GPS debouncing
   bool gpsRawOK = s.gpsOK && isfinite(s.lat) && isfinite(s.lon) && (fabs(s.lat) > 1e-7 || fabs(s.lon) > 1e-7);
   if (gpsRawOK) { gpsGoodCount++; gpsBadCount = 0; } else { gpsBadCount++; gpsGoodCount = 0; }
   bool gpsValid = (gpsGoodCount >= 1);
   if (gpsBadCount >= CONSECUTIVE_FOR_GPS_LOSS) gpsValid = false;
 
   s.gpsOK = gpsValid;
-
-  // encode abnormal into vibration flag as lightweight indicator (keeps struct unchanged)
   if (abnormalVitals) s.vibration = true;
 }
 
-// ---------------- Advertising mode helpers ----------------
-// Request connectable window (ms). call when urgent event seen.
 static void requestConnectableWindow(uint32_t ms) {
   uint32_t t = now_ms();
-  // avoid overflow: if connectableUntil already large, extend
   if (connectableUntil == 0 || t + ms > connectableUntil) connectableUntil = t + ms;
-  Serial.printf("[BLE] Requested connectable window %u ms (until %lu)\n", (unsigned)ms, (unsigned long)connectableUntil);
 }
 
-// Attempt to start non-connectable advertising.
-// Use NimBLEAdvertisingParams if available; fallback otherwise.
-// FIXED: Removed default argument (already in forward declaration)
-static void startNonConnectableAdvert(uint32_t intervalMs) {
+// FIXED: Simplified advertising - always connectable for testing
+static void startAdvertising() {
   if (!pAdvertising) return;
-  Serial.println("[BLE] Starting NON-CONNECTABLE advert");
-#if defined(NimBLEAdvertisingParams)
-  NimBLEAdvertisingParams params;
-  params.setConnectable(false);
-  // leave interval as default (implementation-specific) or set if available
+  
   pAdvertising->stop();
-  if (!lastManufacturerData.empty()) {
-    Serial.print("[BLE] Setting manufacturer data for non-connectable advert: ");
-    printHex(lastManufacturerData);
-    pAdvertising->setManufacturerData(lastManufacturerData);
+  delay(100);
+  
+  // Always connectable when forced
+  if (FORCE_CONNECTABLE_FOR_TESTING) {
+    Serial.println("[BLE] 📡 Starting CONNECTABLE advertising (TESTING MODE)");
+    isCurrentlyConnectable = true;
+  } else {
+    Serial.println("[BLE] 📡 Starting advertising");
   }
-  pAdvertising->start(params);
-#else
-  // fallback: restart advertising with lastManufacturerData (best-effort)
-  pAdvertising->stop();
+  
+  // Set advertising data
+  NimBLEAdvertisementData advData;
+  advData.setName(DEVICE_NAME);
+  advData.addServiceUUID(TELEMETRY_SVC_UUID);
+  pAdvertising->setAdvertisementData(advData);
+  
+  // Set scan response with manufacturer data
   if (!lastManufacturerData.empty()) {
-    pAdvertising->setManufacturerData(lastManufacturerData);
+    NimBLEAdvertisementData scanResp;
+    scanResp.setManufacturerData(lastManufacturerData);
+    pAdvertising->setScanResponseData(scanResp);
   }
+  
   pAdvertising->start();
-#endif
-  isCurrentlyConnectable = false;
+  Serial.println("[BLE] ✅ Advertising started");
 }
 
-// Attempt to start connectable advertising
-// FIXED: Removed default argument (already in forward declaration)
-static void startConnectableAdvert(uint32_t intervalMs) {
-  if (!pAdvertising) return;
-  Serial.println("[BLE] Starting CONNECTABLE advert");
-#if defined(NimBLEAdvertisingParams)
-  NimBLEAdvertisingParams params;
-  params.setConnectable(true);
-  pAdvertising->stop();
-  if (!lastManufacturerData.empty()) {
-    Serial.print("[BLE] Setting manufacturer data for connectable advert: ");
-    printHex(lastManufacturerData);
-    pAdvertising->setManufacturerData(lastManufacturerData);
-  }
-  pAdvertising->start(params);
-#else
-  // fallback: ensure service UUID present (makes client discovery easier) and restart
-  pAdvertising->stop();
-  // service UUID will be provided in the scan response to avoid adv payload overflow
-  if (!lastManufacturerData.empty()) {
-    pAdvertising->setManufacturerData(lastManufacturerData);
-  }
-  pAdvertising->start();
-#endif
-  isCurrentlyConnectable = true;
-}
-
-// ---------------- Build advert from snapshot ----------------
-// manufacturer data layout (21 bytes): see preceding docs
 static void buildAndSetAdvertFromSnapshot() {
   Telemetry s;
   if (snapshotMutex && xSemaphoreTake(snapshotMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
     s = lastSnapshot;
     xSemaphoreGive(snapshotMutex);
-  } else {
-    // default zero snapshot
   }
 
-  // stabilize flags
   evaluateAlertsFromSnapshot(s);
 
-  // Build manufacturer payload
   uint8_t buf[21];
   memset(buf, 0, sizeof(buf));
   buf[0] = COMPANY_ID & 0xFF;
@@ -323,11 +309,11 @@ static void buildAndSetAdvertFromSnapshot() {
                 ((s.bpm > 0.5f && (s.bpm < 60.0f || s.bpm > 100.0f)) ||
                  (s.spo2 > 0.5f && s.spo2 < 90.0f));
   if (urgent) flags |= (1<<3);
-  if (s.vibration) flags |= (1<<5); // abnormalVitals proxy
+  if (s.vibration) flags |= (1<<5);
   if (s.gpsOK) flags |= (1<<6);
   buf[3] = flags;
 
-  buf[4] = 100; // battery placeholder
+  buf[4] = 100;
   buf[5] = (uint8_t)((s.bpm > 0.5f && isfinite(s.bpm)) ? constrain((int)round(s.bpm), 0, 255) : 0);
   buf[6] = (uint8_t)((s.spo2 > 0.5f && isfinite(s.spo2)) ? constrain((int)round(s.spo2), 0, 255) : 0);
   uint16_t co2 = (uint16_t)constrain((int)round(isnan(s.co2ppm) ? 0 : s.co2ppm), 0, 65535);
@@ -350,99 +336,51 @@ static void buildAndSetAdvertFromSnapshot() {
   man[20] = crc;
   uint32_t now = now_ms();
 
-  // If we're still in the startup capture window, wait until the window expires
-  // and take one stable snapshot to use as the manufacturer data.
   if (!startupSnapshotCaptured) {
-    if (now < startupCaptureUntil) {
-      // skip updating manuf data for now (stabilize sensors)
-      return;
-    }
-    // capture initial stable manufacturer blob
+    if (now < startupCaptureUntil) return;
     lastManufacturerData = man;
     startupSnapshotCaptured = true;
     lastManufacturerUpdateAt = now;
-    Serial.println("[BLE] Startup manufacturer snapshot captured");
-    Serial.print("[BLE] Initial manufacturer data: "); printHex(lastManufacturerData);
-    if (pAdvertising) {
-      // Put Name + 128-bit Service UUID into the advertising packet (fits within 31 bytes)
-      NimBLEAdvertisementData advData;
-      advData.setName(DEVICE_NAME);
-      advData.addServiceUUID(TELEMETRY_SVC_UUID);
-      pAdvertising->setAdvertisementData(advData);
-      // Put Manufacturer data into the scan response so it fits there
-      NimBLEAdvertisementData scanResp;
-      scanResp.setManufacturerData(lastManufacturerData);
-      pAdvertising->setScanResponseData(scanResp);
-      pAdvertising->start();
-    }
-    // If urgent: request connectable window
+    Serial.println("[BLE] 📸 Startup manufacturer snapshot captured");
+    startAdvertising();
     if (urgent) requestConnectableWindow(CONNECTABLE_WINDOW_MS);
     return;
   }
 
-  // After initial capture, throttle manufacturer updates to avoid rapid churn
-  if ((now - lastManufacturerUpdateAt) < MANUF_UPDATE_INTERVAL_MS) {
-    // too soon to update
-    return;
-  }
+  if ((now - lastManufacturerUpdateAt) < MANUF_UPDATE_INTERVAL_MS) return;
 
-  // Time to update the manufacturer payload
   lastManufacturerData = man;
   lastManufacturerUpdateAt = now;
-  if (pAdvertising) {
-    NimBLEAdvertisementData advData;
-    // Put Name + 128-bit Service UUID into the advertising packet (fits within 31 bytes)
-    advData.setName(DEVICE_NAME);
-    advData.addServiceUUID(TELEMETRY_SVC_UUID);
-    pAdvertising->setAdvertisementData(advData);
-    NimBLEAdvertisementData scanResp;
-    // Put Manufacturer data into the scan response so scanners will show it
-    scanResp.setManufacturerData(lastManufacturerData);
-    pAdvertising->setScanResponseData(scanResp);
-    Serial.print("[BLE] Updated manufacturer data: ");
-    printHex(lastManufacturerData);
-    if (urgent) requestConnectableWindow(CONNECTABLE_WINDOW_MS);
-    pAdvertising->start();
+  
+  // Only restart advertising if not connected
+  if (!deviceConnected && pAdvertising) {
+    startAdvertising();
   }
 }
 
-// ---------------- Notifications ----------------
+// FIXED: Only send if subscribed
 static void sendNotificationIfConnected() {
-  static uint32_t lastDebugTime = 0;
-  uint32_t now = millis();
-  
-  if (!deviceConnected || !pStreamChar) {
-    if (now - lastDebugTime >= 5000) { // Print every 5 seconds to avoid flooding
-      Serial.printf("[BLE] Skip notification: connected=%d pStreamChar=%d clientAuth=%d\n", 
-                   deviceConnected, (pStreamChar != nullptr), clientAuthorized);
-      lastDebugTime = now;
-    }
+  if (!deviceConnected || !pStreamChar || !clientSubscribed) {
     return;
   }
 
   if (REQUIRE_APP_AUTH && !clientAuthorized) {
-    if (now - lastDebugTime >= 5000) {
-      Serial.println("[BLE] Skip notification: auth required but not authorized");
-      lastDebugTime = now;
-    }
     return;
   }
 
-  Serial.println("[BLE] Preparing notification...");
   Telemetry s;
   if (snapshotMutex && xSemaphoreTake(snapshotMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
     s = lastSnapshot;
     xSemaphoreGive(snapshotMutex);
   }
 
-  // ensure snapshot and adv flags consistent
   evaluateAlertsFromSnapshot(s);
 
-  // Build tiny stream packet: header(2), type, seq, ts6, bpm, spo2, co2, flags
-  uint8_t packet[1+1+1+1+6+1+1+2+1];
+  // Build packet
+  uint8_t packet[18];
   int idx = 0;
   packet[idx++] = 0xA1; packet[idx++] = 0xB2;
-  packet[idx++] = 1; // type = stream
+  packet[idx++] = 1; // type
   packet[idx++] = seqNo++;
   uint64_t ts = (uint64_t)millis();
   for (int i = 0; i < 6; ++i) packet[idx++] = (ts >> (8*i)) & 0xFF;
@@ -458,97 +396,52 @@ static void sendNotificationIfConnected() {
   packet[idx++] = flags;
 
   memcpy(lastPacketBuf, packet, idx);
-  // send notify - use indicate for critical one-shot messages if you want guaranteed delivery
   lastPacketLen = idx;
-  Serial.print("[BLE] Sending notification, len=");
-  Serial.print(lastPacketLen);
-  Serial.print(" data=");
-  for(int i = 0; i < lastPacketLen; i++) {
-    if(lastPacketBuf[i] < 16) Serial.print("0");
-    Serial.print(lastPacketBuf[i], HEX);
-    Serial.print(" ");
-  }
-  Serial.println();
+
+  // Send notification
+  bool sent = pStreamChar->notify(lastPacketBuf, lastPacketLen);
   
-  if (pStreamChar->notify(lastPacketBuf, lastPacketLen)) {
-    Serial.println("[BLE] Notification sent successfully");
+  if (sent) {
+    Serial.printf("[BLE] 📡 Notification #%d sent: BPM=%d SpO2=%d CO2=%d\n", 
+                  (int)(seqNo-1), (int)s.bpm, (int)s.spo2, (int)s.co2ppm);
   } else {
-    Serial.println("[BLE] Failed to send notification");
+    Serial.println("[BLE] ❌ Notification FAILED to send");
   }
-  lastSentAt = now_ms(); 
+  
+  lastSentAt = now_ms();
   awaitingAck = true;
 }
 
 // ---------------- BLE background task ----------------
 static void bleTask(void* pv) {
-  const TickType_t advertPeriod = pdMS_TO_TICKS(ADVERT_INTERVAL_MS_NORMAL);
+  const TickType_t advertPeriod = pdMS_TO_TICKS(5000); // Update adv less frequently
   const TickType_t notifyPeriod = pdMS_TO_TICKS(1000);
   TickType_t lastAdv = xTaskGetTickCount();
   TickType_t lastNotify = xTaskGetTickCount();
 
-  // initial mode: non-connectable
-  if (FORCE_CONNECTABLE_FOR_TESTING) {
-    Serial.println("[BLE] FORCING CONNECTABLE advert for testing (set FORCE_CONNECTABLE_FOR_TESTING=false to revert)");
-    startConnectableAdvert(ADVERT_INTERVAL_MS_NORMAL);
-  } else {
-    startNonConnectableAdvert(ADVERT_INTERVAL_MS_NORMAL);
-  }
+  Serial.println("[BLE] 🚀 BLE Task started");
 
   while (true) {
     TickType_t nowT = xTaskGetTickCount();
     uint32_t now = now_ms();
 
-    // decide advertising connectability based on connectableUntil
-    if (connectableUntil != 0 && now < connectableUntil) {
-      // should be connectable
-      if (!isCurrentlyConnectable) {
-        startConnectableAdvert(ADVERT_INTERVAL_MS_URGENT);
-      }
-    } else {
-      // ensure non-connectable mode
-      if (isCurrentlyConnectable) {
-        startNonConnectableAdvert(ADVERT_INTERVAL_MS_NORMAL);
-      }
-      // clear connectableUntil when expired
-      if (connectableUntil != 0 && now >= connectableUntil) {
-        connectableUntil = 0;
-      }
-    }
-
-    if (nowT - lastAdv >= advertPeriod) {
+    // Update advertising data periodically (but don't restart if connected)
+    if (!deviceConnected && (nowT - lastAdv >= advertPeriod)) {
       lastAdv = nowT;
-      // refresh advert manufacturer payload (reads lastSnapshot)
       buildAndSetAdvertFromSnapshot();
     }
 
-    static uint32_t notifyCounter = 0;
-    if (deviceConnected && (nowT - lastNotify >= notifyPeriod)) {
+    // Send notifications if connected and subscribed
+    if (deviceConnected && clientSubscribed && (nowT - lastNotify >= notifyPeriod)) {
       lastNotify = nowT;
-      notifyCounter++;
-      
-      Serial.printf("\n[BLE] Notification #%lu: connected=%d auth=%d\n", 
-                   notifyCounter, deviceConnected, clientAuthorized);
-      
-      // Read current snapshot for debug
-      Telemetry s;
-      if (snapshotMutex && xSemaphoreTake(snapshotMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        s = lastSnapshot;
-        xSemaphoreGive(snapshotMutex);
-        Serial.printf("[BLE] Current values: BPM=%.1f SPO2=%.1f CO2=%.1f\n",
-                     s.bpm, s.spo2, s.co2ppm);
-      } else {
-        Serial.println("[BLE] Failed to read snapshot!");
-      }
-      
       sendNotificationIfConnected();
-      Serial.println("[BLE] Notification cycle complete");
     }
 
-    // resend if ACK not received in time
-    if (awaitingAck && (now - lastSentAt > RETRANSMIT_TIMEOUT_MS)) {
-        Serial.printf("[BLE] Retransmitting seq %u\n", (uint8_t)(seqNo - 1));
-        pStreamChar->notify(lastPacketBuf, lastPacketLen);
-        lastSentAt = now;
+    // Retransmit if needed
+    if (awaitingAck && clientSubscribed && (now - lastSentAt > RETRANSMIT_TIMEOUT_MS)) {
+      Serial.printf("[BLE] 🔄 Retransmitting seq %u\n", (uint8_t)(seqNo - 1));
+      pStreamChar->notify(lastPacketBuf, lastPacketLen);
+      lastSentAt = now;
     }
 
     vTaskDelay(pdMS_TO_TICKS(50));
@@ -559,107 +452,77 @@ static void bleTask(void* pv) {
 void ble_setup() {
   if (!snapshotMutex) snapshotMutex = xSemaphoreCreateMutex();
 
-  Serial.println("[BLE] Initializing NimBLE");
-  // Use a configurable device name so it's easy to spot in scanners like nRF Connect
+  Serial.println("\n╔════════════════════════════════════════╗");
+  Serial.println("║    🚀 INITIALIZING NimBLE SERVER      ║");
+  Serial.println("╚════════════════════════════════════════╝");
+  Serial.printf("[BLE] Device Name: %s\n", DEVICE_NAME);
+  
   NimBLEDevice::init(DEVICE_NAME);
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
-
-  // Optional: enable pairing & bonding at NimBLE level (commented)
-  // NimBLEDevice::initSecurity();
-  // NimBLEDevice::setSecurityAuth(...); // depends on NimBLE-Arduino version and your policy
+  
+  // CRITICAL: Set max MTU for better throughput
+  NimBLEDevice::setMTU(512);
 
   pServer = NimBLEDevice::createServer();
   pServer->setCallbacks(new ServerCallbacks());
 
-  // Print identifying info to Serial so user can match in nRF Connect without connecting
-  if (pServer) {
-    Serial.printf("[BLE] Server created. Device name: %s\n", DEVICE_NAME);
-  } else {
-    Serial.println("[BLE] ERROR: failed to create NimBLE server");
-  }
-  // Print BLE address if available
   auto addr = NimBLEDevice::getAddress();
-  Serial.printf("[BLE] Address: %s\n", addr.toString().c_str());
+  Serial.printf("[BLE] 📍 BLE Address: %s\n", addr.toString().c_str());
 
   NimBLEService* svc = pServer->createService(TELEMETRY_SVC_UUID);
 
+  // Stream characteristic with callbacks
   pStreamChar = svc->createCharacteristic(
     TELEMETRY_STREAM_UUID,
-    NIMBLE_PROPERTY::NOTIFY // we'll use notify; server enforces app-level auth
+    NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ
   );
+  pStreamChar->setCallbacks(new StreamCharCallbacks());
 
-  // Control char: write for token/commands
+  // Control characteristic
   pControlChar = svc->createCharacteristic(
     CONTROL_UUID,
-    NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::READ
+    NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
   );
   pControlChar->setCallbacks(new ControlCallback());
 
   svc->start();
 
   pAdvertising = NimBLEDevice::getAdvertising();
-  // Note: service UUID will be placed in scan response to avoid adv payload overflow
-  // Also set the advertising name field explicitly so scanners display the local name
-    // We'll set the Local Name explicitly in the advertisement payload (advData.setName)
-    // Avoid calling pAdvertising->setName() to prevent duplicate name fields in adv+scan response.
 
-  Serial.print("[BLE] Service UUID: "); Serial.println(TELEMETRY_SVC_UUID);
-  Serial.print("[BLE] Stream Char UUID: "); Serial.println(TELEMETRY_STREAM_UUID);
-  Serial.print("[BLE] Control  Char UUID: "); Serial.println(CONTROL_UUID);
+  Serial.println("\n[BLE] 📋 Service Configuration:");
+  Serial.printf("  Service UUID:  %s\n", TELEMETRY_SVC_UUID);
+  Serial.printf("  Stream UUID:   %s\n", TELEMETRY_STREAM_UUID);
+  Serial.printf("  Control UUID:  %s\n", CONTROL_UUID);
+  Serial.println("\n════════════════════════════════════════\n");
 
-  // (Note: not all NimBLE builds expose setScanResponse; manufacturer data is set explicitly later)
-
-  // initial advert payload empty until ble_publish_snapshot called
-  // schedule startup snapshot capture
   startupCaptureUntil = now_ms() + STARTUP_SNAPSHOT_DELAY_MS;
   startupSnapshotCaptured = false;
   lastManufacturerUpdateAt = 0;
   buildAndSetAdvertFromSnapshot();
-
-  // Print current manufacturer data (if any)
-  if (!lastManufacturerData.empty()) {
-    Serial.print("[BLE] Initial manufacturer data: ");
-    printHex(lastManufacturerData);
-  } else {
-    Serial.println("[BLE] Initial manufacturer data: <empty>");
-  }
 }
 
 void ble_start() {
-  if (pAdvertising) {
-    pAdvertising->start();
-    Serial.println("[BLE] Advertising started");
-  }
-  // Create background BLE task pinned to core 0 (avoid interfering with sensor tasks)
+  startAdvertising();
   xTaskCreatePinnedToCore(bleTask, "BLETask", 8192, NULL, 5, NULL, 0);
+  Serial.println("[BLE] ✅ BLE Service fully started and advertising");
 }
 
-// Publish snapshot (called by main/OLED task). Thread-safe copy.
 void ble_publish_snapshot(const Telemetry* snapshot) {
-  if (!snapshot) {
-    Serial.println("[BLE] ERROR: Null snapshot pointer");
-    return;
-  }
-  if (!snapshotMutex) {
-    Serial.println("[BLE] Creating snapshot mutex");
-    snapshotMutex = xSemaphoreCreateMutex();
-  }
+  if (!snapshot) return;
+  if (!snapshotMutex) snapshotMutex = xSemaphoreCreateMutex();
   if (xSemaphoreTake(snapshotMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
     lastSnapshot = *snapshot;
-    Serial.printf("[BLE] New snapshot: BPM=%.1f SPO2=%.1f CO2=%.1f\n", 
-                 snapshot->bpm, snapshot->spo2, snapshot->co2ppm);
     xSemaphoreGive(snapshotMutex);
-  } else {
-    Serial.println("[BLE] Failed to take snapshot mutex");
   }
-  // Immediately update advert (kick)
-  buildAndSetAdvertFromSnapshot();
+  // Only update advertising if not connected (avoid disrupting connection)
+  if (!deviceConnected) {
+    buildAndSetAdvertFromSnapshot();
+  }
 }
 
-// called whenever the client sends "ACK <seq>"
 static void handleAck(uint8_t ackSeq) {
   if (awaitingAck && ackSeq == (uint8_t)(seqNo - 1)) {
     awaitingAck = false;
-    Serial.printf("[BLE] ACK received for seq %u\n", ackSeq);
+    Serial.printf("[BLE] ✅ ACK received for seq %u\n", ackSeq);
   }
 }
