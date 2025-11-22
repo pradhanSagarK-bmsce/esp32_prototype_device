@@ -20,6 +20,8 @@ struct Telemetry {
   bool tilt;
   bool vibration;
   bool fall;
+  bool smokeOrFire;
+  bool urgent;
   // BME
   float tempBME, humBME, pressBME;
   // GPS

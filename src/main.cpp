@@ -21,6 +21,9 @@ constexpr uint8_t GPS_RX_PIN = 16;
 constexpr uint8_t GPS_TX_PIN = 17;
 constexpr uint32_t GPS_BAUD = 9600;
 constexpr uint8_t MQ135_PIN = 34;
+constexpr float_t MQ_RL = 10000.0f;
+constexpr float_t MQ_VCC = 3.3f;
+constexpr float_t MQ_ADC_MAX = 4095.0f;
 constexpr uint8_t BME_ADDR = 0x76;
 
 // UI Constants (tunable)
@@ -33,6 +36,11 @@ constexpr int GAP = 4;
 constexpr int SMALL_FONT_H = 6;
 constexpr int MED_FONT_H = 10;
 constexpr int LARGE_FONT_H = 14;
+
+constexpr float_t R0 = 12013.0f;       // calibrated R0
+constexpr float_t Rs_cal = 43246.0f;   // Rs measured in clean air
+// Baseline for dynamic scaling (measure actual clean air in your room)
+constexpr float ROOM_BASELINE_PPM = 385.0f;
 
 // ----------------- Devices -----------------
 Adafruit_BME280 bme;
@@ -165,11 +173,12 @@ struct Alert {
   const char* text;
 };
 static Alert pickAlert(const Telemetry& s) {
-  if (s.vibration) return {true, 1, "! VIBRATION" };
-  if (s.fall)      return {true, 2, "! FALL DETECTED" };
-  if (s.shock)     return {true, 3, "! SHOCK" };
-  if (s.freefall)  return {true, 4, "! FREEFALL" };
-  if (s.tilt)      return {true, 5, "! TILT" };
+  if(s.smokeOrFire) return {true, 1, "! SMOKE/FIRE !" };
+  if (s.vibration) return {true, 2, "! VIBRATION" };
+  if (s.fall)      return {true, 3, "! FALL DETECTED" };
+  if (s.shock)     return {true, 4, "! SHOCK" };
+  if (s.freefall)  return {true, 5, "! FREEFALL" };
+  if (s.tilt)      return {true, 6, "! TILT" };
   return {false, 255, ""};
 }
 
@@ -355,19 +364,65 @@ void bmeTask(void* pv) {
   }
 }
 
-// ----------------- MQ Task -----------------
-void mqTask(void* pv) {
-  const TickType_t period = pdMS_TO_TICKS(3500);
-  TickType_t lastWake = xTaskGetTickCount();
 
-  for (;;) {
-    vTaskDelayUntil(&lastWake, period);
+
+// ------------------ Curve constants (3.3V) -----------------
+float A_33V = 6930.84f;
+float B_33V = -2.26f;
+
+// ------------------ EMA smoothing -----------------
+float emaPpm = ROOM_BASELINE_PPM;      // initialize with room baseline
+constexpr float EMA_ALPHA = 0.2f;  // 0.1–0.3 typical
+
+// ------------------ MQ Functions -----------------
+float mqGetRs() {
     int raw = analogRead(MQ135_PIN);
-    float voltage = raw*(3.3f/4095.0f);
-    float co2 = 116.6020682f*pow((voltage/3.3f), -2.769034857f);
-    if (xSemaphoreTake(dataMutex,pdMS_TO_TICKS(20))==pdTRUE) { telem.co2ppm=co2; xSemaphoreGive(dataMutex); }
-  }
+    float vout = raw * (MQ_VCC / MQ_ADC_MAX);
+    return MQ_RL * ((MQ_VCC / vout) - 1.0f);
 }
+
+
+float mqGetCO2ppm() {
+    // --- Step 1: Average multiple Rs readings ---
+    constexpr int NUM_SAMPLES = 10;
+    float RsSum = 0.0f;
+    for (int i = 0; i < NUM_SAMPLES; i++) {
+        RsSum += mqGetRs();
+        delay(50); // small delay between readings
+    }
+    float Rs = RsSum / NUM_SAMPLES;
+
+    // --- Step 2: Calculate ppm using recalculated curve ---
+    float ratio = Rs / R0;
+    float rawPpm = A_33V * powf(ratio, B_33V);
+
+    // --- Step 3: Scale to room baseline ---
+    float scaledPpm = rawPpm * (ROOM_BASELINE_PPM / (A_33V * powf(Rs_cal / R0, B_33V)));
+
+    // --- Step 4: Apply EMA smoothing ---
+    emaPpm = EMA_ALPHA * scaledPpm + (1.0f - EMA_ALPHA) * emaPpm;
+
+    return emaPpm;
+}
+
+
+// ------------------ MQ Task -----------------
+void mqTask(void* pv) {
+    const TickType_t period = pdMS_TO_TICKS(3500);
+    TickType_t lastWake = xTaskGetTickCount();
+
+    for (;;) {
+        vTaskDelayUntil(&lastWake, period);
+
+        float co2 = mqGetCO2ppm();
+
+        if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+            telem.co2ppm = co2;
+            xSemaphoreGive(dataMutex);
+        }
+    }
+}
+
 
 // ----------------- OLED Task -----------------
 void oledTask(void* pv) {
